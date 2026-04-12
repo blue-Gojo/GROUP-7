@@ -9,12 +9,56 @@ const cors    = require('cors');
 const fetch   = require('node-fetch');
 const path    = require('path');
 
+// ── Import Quality Metrics Modules ────────────────────────────
+const { calculateSMI } = require('./metrics/maturity');
+const { calculateUsability } = require('./metrics/usability');
+const { assessSecurityLevel } = require('./metrics/security');
+const { getMaintainabilityReport } = require('./metrics/maintainability');
+const { calculatePortability } = require('./metrics/portability');
+const {
+  reliabilityState,
+  getPDF,
+  getCDF,
+  getReliability,
+  getMTTF,
+  getAvailability,
+  getHazardRate,
+  getFailureIntensityBasic,
+  getFailureIntensityPoisson,
+  getMeanFailuresBasic,
+  getMeanFailuresPoisson,
+  getFailureIntensityFromMuBasic,
+  getFailureIntensityFromMuPoisson,
+  getAdditionalTestTimeBasic,
+  getAdditionalTestTimePoisson,
+  getMeanFailuresExperienced,
+  computeLaplaceFactor,
+  updateReliabilityTrend
+} = require('./metrics/reliability');
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ── Quality Metrics Tracking ──────────────────────────────────
+const metricsStore = {
+  // Reliability metrics
+  reliability: {
+    totalRequests: 0,
+    failedRequests: 0,
+    faultToleranceRate: 100
+  },
+  // Efficiency metrics
+  efficiency: {
+    latencyReadings: [], // Array to store last 100 latency values
+    maxReadings: 100
+  },
+  // Initialize other metrics
+  calculatedAt: null
+};
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', (req, res) => {
@@ -23,20 +67,37 @@ app.get('/health', (req, res) => {
 
 // ── Chat route ────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
+  // Track this request in both metricsStore and reliabilityState
+  metricsStore.reliability.totalRequests++;
+  reliabilityState.totalRequests++;
+
   const { messages, mode } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
+    metricsStore.reliability.failedRequests++;
+    reliabilityState.failedRequests++;
+    reliabilityState.failureTimes.push(Date.now());
+    updateReliabilityTrend();
+    updateFaultToleranceRate();
     return res.status(400).json({ error: 'messages array is required' });
   }
 
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey || apiKey === 'paste_your_groq_api_key_here') {
+    metricsStore.reliability.failedRequests++;
+    reliabilityState.failedRequests++;
+    reliabilityState.failureTimes.push(Date.now());
+    updateReliabilityTrend();
+    updateFaultToleranceRate();
     return res.status(500).json({
       error: 'Groq API key not set. Open the .env file and paste your key from console.groq.com'
     });
   }
 
   const systemPrompt = SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.general;
+
+  // Record latency start
+  const latencyStart = Date.now();
 
   try {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -56,9 +117,19 @@ app.post('/api/chat', async (req, res) => {
       })
     });
 
+    // Record latency end
+    const latencyEnd = Date.now();
+    const latency = latencyEnd - latencyStart;
+    recordLatency(latency);
+
     const data = await response.json();
 
     if (!response.ok) {
+      metricsStore.reliability.failedRequests++;
+      reliabilityState.failedRequests++;
+      reliabilityState.failureTimes.push(Date.now());
+      updateReliabilityTrend();
+      updateFaultToleranceRate();
       console.error('Groq error:', data);
       return res.status(response.status).json({
         error: data.error?.message || 'Groq API error. Check your API key.'
@@ -67,15 +138,230 @@ app.post('/api/chat', async (req, res) => {
 
     const reply = data.choices?.[0]?.message?.content || '';
     if (!reply) {
+      metricsStore.reliability.failedRequests++;
+      reliabilityState.failedRequests++;
+      reliabilityState.failureTimes.push(Date.now());
+      updateReliabilityTrend();
+      updateFaultToleranceRate();
       return res.status(500).json({ error: 'Empty response from Groq.' });
     }
 
     res.json({ reply });
 
   } catch (err) {
+    metricsStore.reliability.failedRequests++;
+    reliabilityState.failedRequests++;
+    reliabilityState.failureTimes.push(Date.now());
+    updateReliabilityTrend();
+    updateFaultToleranceRate();
     console.error('Server error:', err.message);
     res.status(500).json({ error: 'Server error: ' + err.message });
   }
+});
+
+// ── Helper Functions for Metrics ──────────────────────────────
+function updateFaultToleranceRate() {
+  if (metricsStore.reliability.totalRequests > 0) {
+    const succeeded = metricsStore.reliability.totalRequests - 
+                      metricsStore.reliability.failedRequests;
+    metricsStore.reliability.faultToleranceRate = 
+      parseFloat((succeeded / metricsStore.reliability.totalRequests * 100).toFixed(2));
+  }
+}
+
+function recordLatency(latency) {
+  metricsStore.efficiency.latencyReadings.push(latency);
+  if (metricsStore.efficiency.latencyReadings.length > metricsStore.efficiency.maxReadings) {
+    metricsStore.efficiency.latencyReadings.shift(); // Keep only last 100
+  }
+}
+
+// ── Metrics Endpoints ────────────────────────────────────────
+// GET /api/metrics/reliability
+app.get('/api/metrics/reliability', (req, res) => {
+  // Calculate elapsed time in minutes
+  const elapsedMs = Date.now() - reliabilityState.sessionStartTime;
+  const elapsedMinutes = Math.max(elapsedMs / (1000 * 60), 0.01); // Min 0.01 to avoid divide by zero
+
+  // Calculate MTTF from observed failure times
+  let observedMTTF = 0;
+  let observedAvailability = 0;
+  let observedReliability = 0;
+  let observedLambda = 0;
+
+  if (reliabilityState.failedRequests > 0 && elapsedMs > 0) {
+    observedMTTF = Math.round((elapsedMs / reliabilityState.failedRequests) / 10000) / 100; // Convert to minutes
+    observedLambda = 1 / Math.max(observedMTTF, 0.01); // Failure rate per minute
+    
+    // A = MTTF / (MTTF + MTTR), where MTTR = 0.5 minutes
+    const MTTR = 0.5;
+    observedAvailability = Math.round((observedMTTF / (observedMTTF + MTTR)) * 10000) / 10000;
+    
+    // R(t) = e^(-lambda*t) for current uptime
+    observedReliability = Math.round(Math.exp(-observedLambda * elapsedMinutes) * 10000) / 10000;
+  }
+
+  // Basic Exponential model: lambda0 = 0.1, v0 = 10, tau = current uptime
+  const basicExpModel = {
+    lambda0: 0.1,
+    v0: 10,
+    tau: elapsedMinutes,
+    failureIntensity: getFailureIntensityBasic(0.1, 10, elapsedMinutes),
+    meanFailures: getMeanFailuresBasic(0.1, 10, elapsedMinutes),
+    additionalTestTime: getAdditionalTestTimeBasic(10, 0.1, 0.05, 0.01)
+  };
+
+  // Logarithmic Poisson model: lambda0 = 0.1, theta = 0.02, tau = current uptime
+  const poissonModel = {
+    lambda0: 0.1,
+    theta: 0.02,
+    tau: elapsedMinutes,
+    failureIntensity: getFailureIntensityPoisson(0.1, 0.02, elapsedMinutes),
+    meanFailures: getMeanFailuresPoisson(0.1, 0.02, elapsedMinutes),
+    additionalTestTime: getAdditionalTestTimePoisson(0.02, 0.01, 0.05)
+  };
+
+  res.json({
+    // Live tracking values from reliabilityState
+    liveTracking: {
+      totalRequests: reliabilityState.totalRequests,
+      failedRequests: reliabilityState.failedRequests,
+      successfulRequests: reliabilityState.totalRequests - reliabilityState.failedRequests,
+      faultToleranceRate: Math.round(reliabilityState.faultToleranceRate * 100) / 100,
+      sessionStartTime: new Date(reliabilityState.sessionStartTime).toISOString(),
+      elapsedMinutes: Math.round(elapsedMinutes * 100) / 100,
+      failureCount: reliabilityState.failureTimes.length,
+      interFailureTimesCount: reliabilityState.interFailureTimes.length
+    },
+
+    // Observed reliability metrics
+    observedMetrics: {
+      MTTF: Math.round(observedMTTF * 10000) / 10000,
+      lambda: Math.round(observedLambda * 10000) / 10000,
+      availability: observedAvailability,
+      currentReliability: observedReliability
+    },
+
+    // Laplace factor and trend
+    reliabilityTrend: {
+      laplaceFactor: reliabilityState.laplaceFactor,
+      trend: reliabilityState.reliabilityTrend,
+      interpretation: reliabilityState.laplaceFactor === null
+        ? 'Insufficient data (need 3+ inter-failure times)'
+        : reliabilityState.laplaceFactor < -2
+          ? 'Growth: Failure rate is decreasing'
+          : reliabilityState.laplaceFactor > 2
+            ? 'Degradation: Failure rate is increasing'
+            : 'Stable: Failure rate is consistent'
+    },
+
+    // Sample model outputs
+    models: {
+      basicExponential: basicExpModel,
+      logarithmicPoisson: poissonModel
+    },
+
+    // For backward compatibility with existing metrics
+    totalRequests: reliabilityState.totalRequests,
+    failedRequests: reliabilityState.failedRequests,
+    successfulRequests: reliabilityState.totalRequests - reliabilityState.failedRequests,
+    faultToleranceRate: Math.round(reliabilityState.faultToleranceRate * 100) / 100
+  });
+});
+
+// GET /api/metrics/efficiency
+app.get('/api/metrics/efficiency', (req, res) => {
+  const readings = metricsStore.efficiency.latencyReadings;
+  
+  if (readings.length === 0) {
+    return res.json({
+      averageLatencyMs: 0,
+      minLatencyMs: 0,
+      maxLatencyMs: 0,
+      sampleCount: 0,
+      message: 'No latency readings recorded yet'
+    });
+  }
+
+  const average = readings.reduce((a, b) => a + b, 0) / readings.length;
+  const min = Math.min(...readings);
+  const max = Math.max(...readings);
+
+  res.json({
+    averageLatencyMs: parseFloat(average.toFixed(2)),
+    minLatencyMs: min,
+    maxLatencyMs: max,
+    sampleCount: readings.length
+  });
+});
+
+// GET /api/metrics - Master metrics endpoint
+app.get('/api/metrics', (req, res) => {
+  // Calculate all metrics
+  const smiResult = calculateSMI(9, 0, 0, 0); // 9 therapy modes, no changes
+  const usabilityResult = calculateUsability();
+  const securityResult = assessSecurityLevel();
+  const maintainabilityResult = getMaintainabilityReport();
+  const portabilityResult = calculatePortability();
+
+  // Efficiency metrics
+  const readings = metricsStore.efficiency.latencyReadings;
+  let efficiencyMetrics = {
+    averageLatencyMs: 0,
+    minLatencyMs: 0,
+    maxLatencyMs: 0,
+    sampleCount: 0
+  };
+  
+  if (readings.length > 0) {
+    const average = readings.reduce((a, b) => a + b, 0) / readings.length;
+    efficiencyMetrics = {
+      averageLatencyMs: parseFloat(average.toFixed(2)),
+      minLatencyMs: Math.min(...readings),
+      maxLatencyMs: Math.max(...readings),
+      sampleCount: readings.length
+    };
+  }
+
+  res.json({
+    timestamp: new Date().toISOString(),
+    reliability: {
+      smi: smiResult.SMI,
+      smiStability: smiResult.stability,
+      totalRequests: metricsStore.reliability.totalRequests,
+      failedRequests: metricsStore.reliability.failedRequests,
+      faultToleranceRate: metricsStore.reliability.faultToleranceRate
+    },
+    usability: {
+      UA: usabilityResult.UA,
+      availableFunctionsCount: usabilityResult.availableFunctionsCount,
+      requiredFunctionsCount: usabilityResult.requiredFunctionsCount,
+      functionalityStatus: usabilityResult.functionalityStatus
+    },
+    efficiency: efficiencyMetrics,
+    security: {
+      level: securityResult.overallSecurityLevel,
+      levelDescription: securityResult.levelDescription,
+      score: securityResult.securityScore,
+      maxScore: securityResult.maxScore,
+      percentage: securityResult.securityPercentage
+    },
+    maintainability: {
+      changeabilityScore: maintainabilityResult.changeability.changeabilityScore,
+      nestedLevels: maintainabilityResult.changeability.numberOfNestedLevels,
+      variables: maintainabilityResult.changeability.numberOfVariables,
+      jumps: maintainabilityResult.changeability.numberOfJumps,
+      analyzabilityScore: maintainabilityResult.analyzabilityScore,
+      maintainabilityIndex: maintainabilityResult.maintainabilityIndex,
+      rating: maintainabilityResult.summary.rating
+    },
+    portability: {
+      degreeOfPortability: portabilityResult.degreeOfPortability,
+      portabilityPercentage: portabilityResult.portabilityPercentage,
+      portabilityRating: portabilityResult.portabilityRating,
+      portabilityLevel: portabilityResult.portabilityLevel
+    }
+  });
 });
 
 // Serve frontend for all other routes
@@ -96,6 +382,53 @@ app.listen(PORT, () => {
     console.log('  ✅  Groq API key loaded');
   }
   console.log('');
+
+  // ── Quality Metrics Display ───────────────────────────────────
+  console.log('  📊 QUALITY METRICS (ISO 9126 Standard)');
+  console.log('  ════════════════════════════════════════════════════');
+  
+  try {
+    // RELIABILITY - Software Maturity Index
+    const smiResult = calculateSMI(9, 0, 0, 0);
+    console.log(`  ✅ RELIABILITY (Software Maturity Index)`);
+    console.log(`     SMI = ${smiResult.SMI} (${smiResult.stability})`);
+    console.log('');
+
+    // USABILITY Metric
+    const usabilityResult = calculateUsability();
+    console.log(`  ✅ USABILITY`);
+    console.log(`     UA = ${usabilityResult.UA}% (${usabilityResult.functionalityStatus})`);
+    console.log('');
+
+    // EFFICIENCY - Portability
+    const portabilityResult = calculatePortability();
+    console.log(`  ✅ PORTABILITY`);
+    console.log(`     DP = ${portabilityResult.portabilityPercentage}% (${portabilityResult.portabilityRating})`);
+    console.log('');
+
+    // SECURITY Level
+    const securityResult = assessSecurityLevel();
+    console.log(`  ✅ SECURITY`);
+    console.log(`     Level = ${securityResult.overallSecurityLevel}/5 (${securityResult.levelDescription})`);
+    console.log(`     Score = ${securityResult.securityPercentage}%`);
+    console.log('');
+
+    // MAINTAINABILITY
+    const maintainabilityResult = getMaintainabilityReport();
+    console.log(`  ✅ MAINTAINABILITY`);
+    console.log(`     Index = ${maintainabilityResult.maintainabilityIndex}/100 (${maintainabilityResult.summary.rating})`);
+    console.log(`     Changeability = ${maintainabilityResult.changeability.changeabilityScore}%`);
+    console.log('');
+
+    console.log('  ════════════════════════════════════════════════════');
+    console.log('  📡 Metric Endpoints:');
+    console.log(`     http://localhost:${PORT}/api/metrics (all metrics)`);
+    console.log(`     http://localhost:${PORT}/api/metrics/reliability`);
+    console.log(`     http://localhost:${PORT}/api/metrics/efficiency`);
+    console.log('');
+  } catch (err) {
+    console.error('  ⚠️  Error loading quality metrics:', err.message);
+  }
 });
 
 
